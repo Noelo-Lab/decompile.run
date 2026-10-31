@@ -1,0 +1,294 @@
+// kuna-worker-client.js — request/response facade for the decompiler Worker.
+
+export class KunaWorkerCancelledError extends Error {
+  constructor(message = 'decompiler operation cancelled') {
+    super(message);
+    this.name = 'KunaWorkerCancelledError';
+  }
+}
+
+function asUrl(value, base) {
+  return new URL(value, base).href;
+}
+
+export class KunaWorkerClient {
+  constructor({
+    workerUrl = new URL('./kuna-worker.js', import.meta.url),
+    wasmUrl,
+    specRoot,
+    smallBundleUrl,
+    baseUrl = globalThis.document?.baseURI || import.meta.url,
+    workerFactory,
+  }) {
+    if (!wasmUrl || !specRoot) throw new Error('wasmUrl and specRoot are required');
+    this.workerUrl = asUrl(workerUrl, baseUrl);
+    this.initParams = {
+      wasmUrl: asUrl(wasmUrl, baseUrl),
+      specRoot: asUrl(specRoot, baseUrl).replace(/\/$/, ''),
+    };
+    this.build = null;
+    this.engine = null;
+    this.specs = new Map();
+    this.onbuild = null;
+    if (smallBundleUrl) this.initParams.smallBundleUrl = asUrl(smallBundleUrl, baseUrl);
+    this.workerFactory = workerFactory || ((url, options) => new Worker(url, options));
+    this.pending = new Map();
+    this.nextId = 1;
+    this.generation = 0;
+    this.session = null;
+    this.workerSession = null;
+    this.closed = false;
+    this.spawn();
+  }
+
+  spawn() {
+    const generation = ++this.generation;
+    let worker;
+    try {
+      worker = this.workerFactory(this.workerUrl, { type: 'module' });
+    } catch (error) {
+      throw this.startupError(error?.message);
+    }
+    this.worker = worker;
+    this.workerSession = null;
+    this.fatalError = null;
+    let starting = true;
+    worker.onmessage = ({ data }) => {
+      if (data?.spec) {
+        if (!this.specs.has(data.spec.rel)) this.specs.set(data.spec.rel, data.spec.bytes);
+        return;
+      }
+      if (generation !== this.generation) return;
+      const pending = this.pending.get(data?.id);
+      if (!pending) return;
+      this.pending.delete(data.id);
+      if (data.ok) {
+        starting = false;
+        pending.resolve(data.result);
+      } else {
+        const error = new Error(data.error || 'decompiler worker request failed');
+        if (data.detail) error.detail = data.detail;
+        pending.reject(error);
+      }
+    };
+    worker.onerror = (event) => {
+      if (generation !== this.generation) return;
+      const error = starting
+        ? this.startupError(event?.message)
+        : new Error(event?.message || 'decompiler worker failed');
+      this.failWorker(error, generation, worker);
+    };
+    worker.onmessageerror = () => {
+      if (generation !== this.generation) return;
+      this.failWorker(
+        new Error('decompiler worker returned an unreadable response'),
+        generation,
+        worker,
+      );
+    };
+    const params = { ...this.initParams };
+    if (this.engine) params.engine = { ...this.engine, specs: [...this.specs] };
+    this.readyPromise = this.request('init', params).then((info) => {
+      if (generation === this.generation && !params.engine) {
+        if (info?.engine?.module) this.engine = info.engine;
+        else if (this.build) {
+          const was = this.build;
+          this.build = null;
+          this.onbuild?.(null, was);
+        }
+      }
+      return info;
+    });
+    this.readyPromise.catch(() => {});
+  }
+
+  startupError(detail) {
+    const url = new URL(this.workerUrl);
+    const message = `decompiler worker could not start (${url.pathname}). ` +
+      'A content blocker or browser privacy setting may have blocked it; ' +
+      'allow this site and reload the page.';
+    return new Error(detail ? `${message} Browser error: ${detail}` : message);
+  }
+
+  failWorker(error, generation, worker) {
+    if (generation !== this.generation || worker !== this.worker || this.fatalError) return;
+    this.fatalError = error;
+    worker.terminate();
+    this.rejectPending(error);
+  }
+
+  request(method, params = {}, transfer = []) {
+    if (this.closed) return Promise.reject(new Error('decompiler worker is closed'));
+    if (this.fatalError) return Promise.reject(this.fatalError);
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      try {
+        this.worker.postMessage({ id, method, params }, transfer);
+      } catch (error) {
+        this.pending.delete(id);
+        reject(error);
+      }
+    });
+  }
+
+  rejectPending(error) {
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
+  }
+
+  async ready() {
+    return this.readyPromise;
+  }
+
+  /**
+   * The engine's build id: the SHA-256 of the exact wasm bytes the first
+   * Worker compiled (hashed while they compiled), asked again of the new
+   * Worker when a cancel restarts it meanwhile. Every restarted Worker is
+   * handed that compiled module and the spec files the page has loaded, so
+   * the engine, and its id, stay the page's own whatever the server holds
+   * later. A browser that cannot hand the module over compiles the server's
+   * wasm again; the id is then unknown, and `onbuild` hears of it.
+   */
+  async buildId() {
+    for (;;) {
+      await this.ready();
+      if (this.build) return this.build;
+      const generation = this.generation;
+      try {
+        const { build } = await this.request('build');
+        if (generation !== this.generation) continue;
+        this.build = build;
+        return build;
+      } catch (error) {
+        if (error instanceof KunaWorkerCancelledError || generation !== this.generation) continue;
+        throw error;
+      }
+    }
+  }
+
+  checkGeneration(generation) {
+    if (generation !== this.generation) {
+      throw new KunaWorkerCancelledError();
+    }
+  }
+
+  async setWorkerSession(generation = this.generation) {
+    await this.readyPromise;
+    this.checkGeneration(generation);
+    if (!this.session) throw new Error('no binary is loaded');
+    const session = this.session;
+    if (this.workerSession === session) return;
+    const details = await this.request('setBinary', {
+      bytes: session.bytes,
+      fileName: session.fileName,
+      mode: session.mode,
+      language: session.language,
+    });
+    this.checkGeneration(generation);
+    if (this.session !== session) {
+      throw new KunaWorkerCancelledError('binary session superseded');
+    }
+    session.format = details.format;
+    this.workerSession = session;
+  }
+
+  async load(binaryBytes, {
+    fileName = 'binary', mode = 'auto', language = 'auto', assertions = [],
+  } = {}) {
+    const generation = this.generation;
+    const bytes = binaryBytes instanceof Uint8Array
+      ? binaryBytes
+      : new Uint8Array(binaryBytes);
+    const session = { bytes, fileName, mode, language };
+    this.session = session;
+    this.workerSession = null;
+    await this.setWorkerSession(generation);
+    const inventory = await this.request('list', { assertions });
+    this.checkGeneration(generation);
+    if (this.session !== session) {
+      throw new KunaWorkerCancelledError('binary session superseded');
+    }
+    return {
+      ...inventory,
+      format: session.format,
+    };
+  }
+
+  async format() {
+    const generation = this.generation;
+    await this.setWorkerSession(generation);
+    return this.session.format;
+  }
+
+  /** One request against the current binary session; stale answers are cancelled. */
+  async #call(method, params) {
+    const generation = this.generation;
+    await this.setWorkerSession(generation);
+    const result = await this.request(method, params);
+    this.checkGeneration(generation);
+    return result;
+  }
+
+  async list({ assertions = [] } = {}) {
+    return this.#call('list', { assertions });
+  }
+
+  async decompile(target, { assertions = [] } = {}) {
+    return this.#call('decompile', { target, assertions });
+  }
+
+  async inspect(target, { assertions = [] } = {}) {
+    return this.#call('inspect', { target, assertions });
+  }
+
+  async read(address, length, { assertions = [] } = {}) {
+    return this.#call('read', { address, length, assertions });
+  }
+
+  async xrefs(target, { assertions = [] } = {}) {
+    return this.#call('xrefs', { target, assertions });
+  }
+
+  async strings({ assertions = [] } = {}) {
+    return this.#call('strings', { assertions });
+  }
+
+  async data(address, length = null, { assertions = [] } = {}) {
+    return this.#call('data', { address, length, assertions });
+  }
+
+  async uses(address, length, { assertions = [] } = {}) {
+    return this.#call('uses', { address, length, assertions });
+  }
+
+  async project(displayName, { assertions = [] } = {}) {
+    const result = await this.#call('project', { displayName, assertions });
+    return { ...result, bytes: new Uint8Array(result.bytes) };
+  }
+
+  cancel(message = 'decompiler operation cancelled') {
+    if (this.closed) return;
+    const error = new KunaWorkerCancelledError(message);
+    this.generation++;
+    this.worker.terminate();
+    this.rejectPending(error);
+    this.spawn();
+  }
+
+  clear(message = 'decompiler session cleared') {
+    this.session = null;
+    this.cancel(message);
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.generation++;
+    this.worker.terminate();
+    this.rejectPending(new KunaWorkerCancelledError('decompiler worker closed'));
+    this.session = null;
+    this.engine = null;
+    this.specs.clear();
+  }
+}
