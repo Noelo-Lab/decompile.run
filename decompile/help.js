@@ -1,0 +1,86 @@
+// help.js — "How to use Kuna": the keys worth knowing first, every shortcut
+// behind a disclosure, and the names a decompiler invents, each in one short
+// line. DOM-free: returns the dialog's HTML for app.js to mount.
+
+const TOP_KEYS = [
+  ['/', 'Search the list on the left'],
+  ['Space', 'Switch between the code and assembly'],
+  ['1 – 5', 'Code · Assembly · Bytes · Stack · Data'],
+  ['s', 'Side by side'],
+  ['n', 'Rename what is selected'],
+  ['y', 'Change its type'],
+  ['x', 'Who uses it (cross-references)'],
+  ['e', 'Explain what is selected'],
+  ['u', 'Undo'],
+  ['Esc', 'Close or clear the selection'],
+];
+
+const KEYS = [
+  ['/', 'search the list on the left: functions or strings'],
+  ['Space', 'switch between the code and assembly'],
+  ['1 2 3 4 5', 'Code · Assembly · Bytes · Stack · Data'],
+  ['s', 'side by side (the code next to the assembly)'],
+  ['o', 'addresses: full · offset from the function start · both'],
+  ['b', 'show or hide instruction bytes'],
+  ['↑ ↓', 'move through lines or instructions'],
+  ['← →', 'move between names on a line of code'],
+  ['Enter', 'open the function under the cursor; in Data, follow a pointer'],
+  ['double-click', 'a function or a global in the code: go to it; a variable: rename it'],
+  ['n', 'rename the selected variable or function'],
+  ['y', 'change its type (on a function name: its signature)'],
+  [';', 'add a note to the selected instruction'],
+  ['g', 'go to a function or an address'],
+  ['x', 'cross-references: who calls a function and what it calls, the lines that use a variable, or where a string is used'],
+  ['e', 'open or close the Explain panel'],
+  ['u · Ctrl+Z', 'undo'],
+  ['Ctrl+Shift+Z', 'redo'],
+  ['Alt+← Alt+→', 'back and forward between functions'],
+  ['p', 'when working together: point the others to what the mouse is over'],
+  ['Alt+click', 'the same, on a line, an instruction, a byte or a stack slot'],
+  ['?', 'this help'],
+  ['Esc', 'close the card, then a dialog, then clear the selection'],
+];
+
+const GLOSSARY = [
+  ['v1, v2 …', 'a local variable the decompiler named; rename it to what it means'],
+  ['a0, a1 … / param_1', 'an input (parameter) without a name, in order'],
+  ['local_28', 'a stack slot, named by its position'],
+  ['dat_4010', 'a global variable at that address; double-click it to see its data'],
+  ['struct_0 · field_0x8', 'a structure the decompiler worked out, defined above the function that uses it; the field 0x8 bytes from its start'],
+  ['sub_401000 / FUN_00401000', 'a function without a name, at that address'],
+  ['LAB_00401234', 'a place the code jumps to'],
+  ['undefined4 · int4 · uint8', 'a value of that many bytes: type unknown · signed · unsigned'],
+  ['// rax', 'this variable lives in the register RAX'],
+  ['// rbp - 0x14', 'it lives on the stack, 0x14 bytes below where the frame pointer RBP points, just as [RBP - 0x14] in the assembly (rsp + 0x8 in a function that keeps no frame pointer)'],
+  ['CONCAT44(a,b)', 'two 4-byte values joined into 8 bytes'],
+  ['SEXT48(x) · ZEXT48(x)', 'x widened from 4 to 8 bytes, keeping its sign · with zeros'],
+  ['x._4_8_', 'the 8 bytes of x that start at byte 4'],
+  ['(int)x', 'a cast: x read as an int'],
+];
+
+const LEGEND = [
+  ['var(--accent-bg)', 'a line and the instructions it turns into'],
+  ['var(--select-bg)', 'the name you selected, everywhere it is used'],
+  ['var(--patch-bg)', 'a byte you changed'],
+  ['repeating-linear-gradient(var(--band-0) 0 3px, transparent 3px 5px)', 'side by side: a dashed bar marks an instruction the page grouped with the line it sets up (turn off in View options)'],
+];
+
+const kbd = (k) => k.split(/ · | – /).map((x) => `<kbd>${x}</kbd>`).join(k.includes('–') ? ' – ' : ' ');
+
+export function helpHtml() {
+  const rows = (list) => list.map(([k, v]) => `<tr><td>${kbd(k)}</td><td>${v}</td></tr>`).join('');
+  return '<div class="hh"><h2 id="helptitle">How to use Kuna</h2>' +
+    '<button class="d2-iconbtn small" data-act="help-close" aria-label="Close" title="Close">×</button></div>' +
+    '<div class="hb2">' +
+    '<p>Pick a function on the left. To find text such as a flag or a password prompt, switch the list to <b>Strings</b>, search, and click a function under a string to go to the code that uses it. Click a line of code to see the assembly it becomes; click a name to learn about it, and double-click a variable to rename it. Double-click a function to open it, or a global to see its value, its type and who uses it in the <b>Data</b> tab. Turn on <b>Show hints</b> for tips and for cards that explain what the pointer rests on. Your changes are kept in this browser.</p>' +
+    `<h3>Keyboard</h3><table>${rows(TOP_KEYS)}</table>` +
+    `<details id="helpall"><summary>All shortcuts</summary><table>${rows(KEYS)}</table></details>` +
+    '<h3>Working together</h3><p><b>Collaborate</b> makes an invite link. The person who opens it sends you a reply link; open it and you are in the same session: you see each other\'s changes and pointers, and anyone can change anything. For people on another network, tick <b>Connect across the internet</b> before making the link. Alt+click a line (or press <kbd>p</kbd>) to point the others to it.</p>' +
+    '<h3>Words you\'ll see</h3><dl>' + GLOSSARY.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('') + '</dl>' +
+    '<details><summary>What the colours mean</summary><dl>' +
+    LEGEND.map(([c, v]) => `<dt><span class="d2sw" style="background:${c}"></span></dt><dd>${v}</dd>`).join('') + '</dl></details>' +
+    '</div>';
+}
+
+export const HELP_KEYS = KEYS;
+export const HELP_GLOSSARY = GLOSSARY;
