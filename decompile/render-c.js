@@ -1,0 +1,612 @@
+// render-c.js — the study view's C pane: turns one function's code (plus the
+// engine's token stream when it has one) into escaped HTML rows, and builds
+// the line <-> instruction <-> symbol index every linked view shares. The
+// definitions of the types a function uses, which the engine prints above it,
+// are set apart as a block of their own.
+//
+// DOM-free. Every engine string reaches HTML through escapeHtml. A line whose
+// tokens do not reproduce its text exactly falls back to the regex scanner
+// (assets/js/highlight-c.js `scan`) for that line only.
+import { scan, escapeHtml } from '../assets/js/highlight-c.js';
+import { addrHex, bare } from './addr.js';
+import { splitNotes } from './tags.js';
+
+const CHUNK = 256;
+const MAX_TOKEN_SPANS = 200000;
+
+/** Colour band of a C line (shared with the assembly rows it maps to). */
+export function bandOf(line) {
+  return ((line % 6) + 6) % 6;
+}
+
+/** The first line of a C body when it reads like a signature. */
+function signatureLine(code) {
+  const first = (code || '').split('\n')[0] || '';
+  return first.includes('(') ? first.trim() : null;
+}
+
+function normalizeInsn(insn, entry) {
+  const address_hex = addrHex(insn.address_hex ?? insn.address);
+  let offset = Number.isFinite(insn.offset) ? insn.offset : null;
+  if (offset === null && address_hex && entry) {
+    const d = BigInt(address_hex) - BigInt(entry);
+    offset = Number(d);
+  }
+  return {
+    ...insn,
+    address_hex,
+    offset,
+    size: insn.size ?? (insn.bytes ? insn.bytes.length / 2 : 0),
+    bytes: (insn.bytes || '').toLowerCase(),
+    mnemonic: insn.mnemonic || '',
+    operands: insn.operands || '',
+    text: insn.text || [insn.mnemonic, insn.operands].filter(Boolean).join(' '),
+    file_offset: Number.isInteger(insn.file_offset) ? insn.file_offset : null,
+    lines: Array.isArray(insn.lines) ? insn.lines : [],
+  };
+}
+
+/**
+ * One function as the page works with it, from either an `inspect` document or
+ * a plain `decompile` document (an engine build without `inspect`): the latter
+ * has no tokens and no instructions, and says so through `tokens_error` and
+ * `hasInstructions`. kuna's end-of-line notes leave the code for `notes`
+ * (tags.js `splitNotes`).
+ */
+export function normalizeInspect(result) {
+  const fromInspect = !!result?.function;
+  const fn = fromInspect ? result.function : (result?.functions || [])[0];
+  if (!fn) throw new Error('the engine returned no function');
+  const address_hex = addrHex(fn.address_hex ?? fn.address);
+  const split = splitNotes(fn.code ?? '', Array.isArray(fn.tokens) ? fn.tokens : []);
+  const frame = fn.frame || null;
+  const { code, tokens } = rebaseStackComments(split.code, split.tokens, frameBase(frame));
+  const notes = split.notes;
+  return {
+    source: fromInspect ? 'inspect' : 'decompile',
+    name: fn.name,
+    address_hex,
+    aliases: fn.aliases || [],
+    kind: fn.kind || 'func',
+    size: fn.size ?? 0,
+    code,
+    notes,
+    error: fn.error ?? null,
+    proto: (fn.proto ?? signatureLine(code))?.replace(/^#\[[^\n]*\]\s*\n/gm, '').replace(/;\s*$/, '').trim() ?? null,
+    language: result.language || (/^#\[allow\(|\blet mut\b/m.test(code) ? 'rust-language' : 'c-language'),
+    target: result.target || null,
+    unstructured_gotos: fn.unstructured_gotos ?? 0,
+    line_mappings: fn.line_mappings || [],
+    variables: fn.variables || [],
+    types: fn.types || [],
+    globals: fn.globals || [],
+    tokens,
+    tokens_error: fn.tokens_error ?? (fromInspect || tokens.length
+      ? null
+      : 'no token stream: this engine build answers `decompile`, not `inspect`'),
+    hasInstructions: Array.isArray(fn.instructions),
+    instructions: (fn.instructions || []).map((insn) => normalizeInsn(insn, address_hex)),
+    instructions_truncated: !!fn.instructions_truncated,
+    frame,
+    assertions: result.assertions || [],
+  };
+}
+
+/**
+ * The register a function's stack locations count from, `{register, offset}`:
+ * the one `inspect`'s `frame.base` says the code reads its stack through (on
+ * x86 the frame pointer whenever there is one, else the stack pointer once the
+ * prologue has run); null when neither is known.
+ */
+export function frameBase(frame) {
+  return (frame?.base ? frame[frame.base] : frame?.frame_pointer || frame?.stack_pointer) || null;
+}
+
+/** An offset from the stack pointer at entry as `base` sees it: entry − 0x58 with RBP at entry − 8 is `rbp - 0x50`. */
+export function rebaseStack(entryOffset, base) {
+  const d = entryOffset - base.offset;
+  return `${base.register} ${d < 0 ? '-' : '+'} 0x${Math.abs(d).toString(16)}`;
+}
+
+const ENTRY_BASE = { register: 'stack', offset: 0 };
+
+/** An offset from the stack pointer at entry as the declarations' comments write it: `rbp - 0x50`, or the engine's own `stack - 0x58` without a frame base. */
+export function stackLocation(entryOffset, frame) {
+  return rebaseStack(entryOffset, frameBase(frame) || ENTRY_BASE);
+}
+
+/** The entry offsets a declaration's storage comment places it at (`rax | rbp - 0x50` with RBP at entry − 8 → [-0x58]). */
+export function stackPieces(storage, frame) {
+  const base = frameBase(frame) || ENTRY_BASE;
+  const out = [];
+  for (const piece of (storage || '').split(' | ')) {
+    const m = /^(\w+) ([-+]) 0x([0-9a-f]+)$/.exec(piece.trim());
+    if (m && m[1] === base.register) out.push(base.offset + (m[2] === '-' ? -1 : 1) * parseInt(m[3], 16));
+  }
+  return out;
+}
+
+const STORAGE_PIECE = String.raw`(?:[\w:]+|[\w.]+ 0x[0-9a-f]+|stack [-+] 0x[0-9a-f]+)`;
+const STORAGE_COMMENT = new RegExp(`^// ${STORAGE_PIECE}(?: \\| ${STORAGE_PIECE})*$`);
+const STACK_PIECE = /\bstack ([-+]) 0x([0-9a-f]+)\b/g;
+
+/**
+ * The declarations' storage comments with each `stack - 0x58` (from the stack
+ * pointer at entry) rewritten against `base` (`rbp - 0x50`), so they read like
+ * the assembly's operands; the comment tokens follow.
+ */
+export function rebaseStackComments(code, tokens, base) {
+  if (!base) return { code, tokens };
+  const lines = code.split('\n');
+  const edits = new Map();
+  for (const { line } of localDecls(code)) {
+    const text = lines[line - 1];
+    const at = text.indexOf('//');
+    const comment = at < 0 ? '' : text.slice(at).trimEnd();
+    if (!STORAGE_COMMENT.test(comment)) continue;
+    const next = comment.replace(STACK_PIECE, (_, sign, hex) => rebaseStack((sign === '-' ? -1 : 1) * parseInt(hex, 16), base));
+    if (next === comment) continue;
+    lines[line - 1] = text.slice(0, at) + next + text.slice(at + comment.length);
+    edits.set(line, { at, next, delta: next.length - comment.length });
+  }
+  if (!edits.size) return { code, tokens };
+  return {
+    code: lines.join('\n'),
+    tokens: tokens.map((t) => {
+      const e = edits.get(t.line);
+      if (!e || !Number.isInteger(t.col) || t.col < e.at) return t;
+      return t.col === e.at ? { ...t, text: e.next, len: e.next.length } : { ...t, col: t.col + e.delta };
+    }),
+  };
+}
+
+/**
+ * Per-line segments from the engine tokens: `[{text, tok}]` covering each line
+ * exactly (gaps are `tok: null`), or `null` for a line the tokens do not
+ * reproduce (overlap, text mismatch, uncovered non-blank text).
+ */
+export function tokenLines(code, tokens) {
+  const lines = code.split('\n');
+  const byLine = lines.map(() => []);
+  for (const t of tokens || []) {
+    const i = t.line - 1;
+    if (i >= 0 && i < lines.length && Number.isInteger(t.col) && typeof t.text === 'string') byLine[i].push(t);
+  }
+  return lines.map((text, i) => {
+    const toks = byLine[i].sort((a, b) => a.col - b.col);
+    if (!toks.length) return text.trim() === '' ? (text ? [{ text, tok: null }] : []) : null;
+    const segs = [];
+    let at = 0;
+    for (const t of toks) {
+      const len = Number.isInteger(t.len) ? t.len : t.text.length;
+      if (t.col < at || len !== t.text.length || text.slice(t.col, t.col + len) !== t.text) return null;
+      const gap = text.slice(at, t.col);
+      if (gap.trim() !== '') return null;
+      if (gap) segs.push({ text: gap, tok: null });
+      segs.push({ text: t.text, tok: t });
+      at = t.col + len;
+    }
+    const tail = text.slice(at);
+    if (tail.trim() !== '') return null;
+    if (tail) segs.push({ text: tail, tok: null });
+    return segs;
+  });
+}
+
+const PSEUDO_KIND = {
+  'tok-com': 'comment', 'tok-str': 'value', 'tok-chr': 'value', 'tok-num': 'value',
+  'tok-kw': 'syntax', 'tok-type': 'type', 'tok-fn': 'funcname', 'tok-glob': 'variable',
+};
+
+/**
+ * Per-line segments from the regex scanner, for code the engine sent without
+ * tokens (or a line whose tokens failed verification). Identifiers become
+ * pseudo-tokens so selection and renaming still work: after `.`/`->` a field,
+ * before `(` a function name, a `LAB_…:` a label, anything else a variable.
+ */
+export function fallbackLines(code, { language } = {}) {
+  const dialect = /rust/.test(language || '') ? 'rust' : 'auto';
+  const lines = [[]];
+  let prevText = '';
+  for (const p of scan(code, dialect)) {
+    const parts = p.text.split('\n');
+    parts.forEach((part, k) => {
+      if (k > 0) lines.push([]);
+      if (!part) return;
+      let tok = null;
+      if (p.word) {
+        let kind = PSEUDO_KIND[p.cls] || null;
+        if (!kind && /^[A-Za-z_]/.test(part)) {
+          if (/(\.|->)\s*$/.test(prevText)) kind = 'field';
+          else if (/^LAB_/.test(part)) kind = 'label';
+          else kind = 'variable';
+        }
+        if (kind) tok = { kind, text: part, cls: p.cls, fallback: true };
+      }
+      lines[lines.length - 1].push({ text: part, tok });
+    });
+    prevText = p.text;
+  }
+  return lines;
+}
+
+/**
+ * How many lines open the code with the definitions of the types the function
+ * uses (the engine's `structdefs` preamble, ending in a blank line): the lines
+ * before the signature, which is the first line holding a token that is not
+ * plain syntax, or without tokens the first line starting with the prototype.
+ * 0 when the function names no such type.
+ */
+export function preambleLength(fnData) {
+  if (!fnData.types?.length) return 0;
+  const lines = (fnData.code || '').split('\n');
+  let sig = -1;
+  if (fnData.tokens?.length) {
+    for (const t of fnData.tokens) {
+      if (t.kind && t.kind !== 'syntax' && (sig < 0 || t.line - 1 < sig)) sig = t.line - 1;
+    }
+  } else if (fnData.proto) {
+    sig = lines.findIndex((l) => l.trim().startsWith(fnData.proto));
+  }
+  if (sig <= 0 || lines[sig - 1].trim() !== '') return 0;
+  return sig;
+}
+
+/**
+ * What each preamble line defines: `[{name, opaque}]` per line (null on a blank
+ * line). A `struct X {` … `};` block belongs to X; a `typedef … X;` line to X.
+ */
+export function preambleTypes(code, length) {
+  const out = [];
+  let open = null;
+  for (const text of (code || '').split('\n').slice(0, length)) {
+    const block = /^\s*(?:typedef\s+)?(?:struct|union|enum)\s+([A-Za-z_]\w*)\s*\{/.exec(text);
+    if (block) open = block[1];
+    if (open) {
+      out.push({ name: open, opaque: false });
+      if (/^\s*\}/.test(text) || (block && /\}/.test(text))) open = null;
+      continue;
+    }
+    const named = /\(\s*\*+\s*([A-Za-z_]\w*)\s*\)\s*\(/.exec(text) || /\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*;\s*(\/\*.*\*\/)?\s*$/.exec(text);
+    out.push(named && /;/.test(text) ? { name: named[1], opaque: /\/\*\s*opaque\s*\*\//.test(text) } : null);
+  }
+  return out;
+}
+
+/** The preamble as highlighted, inert segments (`{text, cls}`), the types the function uses coloured as types. */
+function preambleSegs(code, length, typeNames) {
+  const lines = [[]];
+  for (const p of scan((code || '').split('\n').slice(0, length).join('\n'), 'c')) {
+    p.text.split('\n').forEach((part, k) => {
+      if (k > 0) lines.push([]);
+      if (part) lines[lines.length - 1].push({ text: part, cls: p.word && typeNames.has(part) ? 'tok-type' : p.cls || null });
+    });
+  }
+  return lines;
+}
+
+/** Segments for every line: engine tokens where they verify, the scanner elsewhere. */
+export function lineSegments(fnData) {
+  const code = fnData.code || '';
+  const preamble = preambleLength(fnData);
+  const typed = preamble ? preambleSegs(code, preamble, new Set(fnData.types.map((t) => t.name))) : [];
+  const fallback = fallbackLines(code, { language: fnData.language });
+  if (!fnData.tokens?.length || fnData.tokens.length > MAX_TOKEN_SPANS) {
+    return { segs: fallback.map((line, i) => (i < preamble ? typed[i] || [] : line)), fallbackCount: fallback.length, tokenCount: 0, preamble };
+  }
+  const exact = tokenLines(code, fnData.tokens);
+  let fallbackCount = 0;
+  const segs = exact.map((line, i) => {
+    if (i < preamble) return typed[i] || [];
+    if (line) return line;
+    fallbackCount++;
+    return fallback[i] || [];
+  });
+  return { segs, fallbackCount, tokenCount: fnData.tokens.length, preamble };
+}
+
+const STATEMENT = /^\s*(return|if|for|while|do|switch|goto|break|continue|case|default|else)\b|=|^\s*[{}]/;
+const C_DECL = /^\s+(.+?)\s*\b([A-Za-z_]\w*)\s*((?:\[[^\]]*\]\s*)*);\s*(?:\/\/\s*(.+?)\s*)?$/;
+const FNPTR_DECL = /^\s+(.+?)\s*\(\s*(\*+)\s*([A-Za-z_]\w*)\s*\)\s*\(([^()]*)\)\s*;\s*(?:\/\/\s*(.+?)\s*)?$/;
+const RUST_DECL = /^\s+let\s+(?:mut\s+)?([A-Za-z_]\w*)\s*:\s*(.+?);\s*(?:\/\/\s*(.+?)\s*)?$/;
+
+/**
+ * The declarations that open the body (`  long v1; // rax`, `  let mut v1: i64;
+ * // stack - 0x14`), up to the first line that is not one. Register locals
+ * appear nowhere else. A declaration without a storage comment has `storage` ''.
+ */
+export function localDecls(code) {
+  const lines = (code || '').split('\n');
+  const out = [];
+  let inBody = false;
+  for (let i = 0; i < lines.length; i++) {
+    const text = lines[i];
+    if (!inBody) {
+      if (/^\{\s*$/.test(text)) inBody = true;
+      continue;
+    }
+    if (text.trim() === '') break;
+    const rust = RUST_DECL.exec(text);
+    if (rust) {
+      out.push({ name: rust[1], type: rust[2].trim(), storage: rust[3] || '', line: i + 1 });
+      continue;
+    }
+    if (STATEMENT.test(text.replace(/\/\/.*$/, ''))) break;
+    const fp = FNPTR_DECL.exec(text);
+    if (fp) {
+      out.push({ name: fp[3], type: `${fp[1]} (${fp[2]})(${fp[4]})`, storage: fp[5] || '', line: i + 1 });
+      continue;
+    }
+    const m = C_DECL.exec(text);
+    if (!m) break;
+    out.push({ name: m[2], type: (m[1] + (m[3] ? ' ' + m[3].replace(/\s+/g, '') : '')).trim(), storage: m[4] || '', line: i + 1 });
+  }
+  return out;
+}
+
+/** `rax` → `register RAX`; `stack - 0x14` → `stack entry−0x14` (from the stack pointer at entry). */
+export function storageLabel(storage) {
+  if (!storage) return '';
+  const stack = /^stack\s*([-+])\s*(0x[0-9a-f]+|\d+)$/i.exec(storage.trim());
+  if (stack) return `stack entry${stack[1] === '-' ? '−' : '+'}${stack[2]}`;
+  if (/^[a-z][a-z0-9]*$/i.test(storage.trim())) return `register ${storage.trim().toUpperCase()}`;
+  return storage;
+}
+
+const addToMap = (map, key, value) => {
+  if (key == null || value == null) return;
+  let set = map.get(key);
+  if (!set) map.set(key, (set = new Set()));
+  set.add(value);
+};
+
+/**
+ * The shared index: `lineToInsns` / `insnToLines` / `addrToInsn` / `insnIndex`
+ * / `symToLines` / `symToAddrs`. Line mappings come from every source the
+ * engine gives — instruction `lines`, `line_mappings`, token addresses — since
+ * each alone can be sparse.
+ */
+export function buildIndex(fnData, segs = lineSegments(fnData).segs, { inferred = null } = {}) {
+  const lineToInsns = new Map();
+  const insnToLines = new Map();
+  const addrToInsn = new Map();
+  const insnIndex = new Map();
+  const symToLines = new Map();
+  const symToAddrs = new Map();
+  const link = (line, hex) => {
+    if (!hex || !Number.isInteger(line)) return;
+    addToMap(lineToInsns, line, hex);
+    addToMap(insnToLines, hex, line);
+  };
+  fnData.instructions.forEach((insn, i) => {
+    addrToInsn.set(insn.address_hex, insn);
+    insnIndex.set(insn.address_hex, i);
+    for (const line of insn.lines) link(line, insn.address_hex);
+  });
+  for (const m of fnData.line_mappings) {
+    for (const a of m.addresses_hex || m.addresses || []) link(m.line_number, addrHex(a));
+  }
+  segs.forEach((line, i) => {
+    for (const s of line) {
+      const t = s.tok;
+      if (!t) continue;
+      const hex = addrHex(t.address_hex ?? t.address);
+      if (hex && t.kind !== 'comment') link(i + 1, hex);
+      if (t.kind === 'variable') {
+        addToMap(symToLines, t.text, i + 1);
+        if (hex) addToMap(symToAddrs, t.text, hex);
+      }
+    }
+  });
+  for (const v of fnData.variables) {
+    for (const a of v.addresses_hex || v.addresses || []) addToMap(symToAddrs, v.name, addrHex(a));
+  }
+  const order = (set) => [...set].sort((a, b) => {
+    const ia = insnIndex.get(a), ib = insnIndex.get(b);
+    if (ia != null && ib != null) return ia - ib;
+    return BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0;
+  });
+  const lineToInferred = new Map();
+  const inferredLine = new Map();
+  (inferred || []).forEach((row, i) => {
+    const insn = fnData.instructions[i];
+    if (!row?.inferred || !insn) return;
+    for (const line of row.lines) addToMap(lineToInferred, line, insn.address_hex);
+    inferredLine.set(insn.address_hex, row.lines);
+  });
+  const sorted = new Map();
+  for (const [line, set] of lineToInsns) sorted.set(line, order(set));
+  const sortedInferred = new Map();
+  for (const [line, set] of lineToInferred) sortedInferred.set(line, order(set));
+  const lines = new Map();
+  for (const [hex, set] of insnToLines) lines.set(hex, [...set].sort((a, b) => a - b));
+  return {
+    lineToInsns: sorted,
+    lineToInferred: sortedInferred,
+    inferredLine,
+    insnToLines: lines,
+    addrToInsn,
+    insnIndex,
+    symToLines,
+    symToAddrs,
+    lineCount: segs.length,
+  };
+}
+
+const COLOR_CLASS = [
+  [/keyword/i, 'tok-kw'], [/comment/i, 'tok-com'], [/type/i, 'tok-type'], [/func/i, 'tok-fn'],
+  [/global/i, 'tok-glob'], [/param/i, 'tk-param'], [/error/i, 'tk-err'], [/special/i, 'tok-kw'],
+];
+
+/** The CSS class of one token: its `tok-*` colour plus `t` and `tk-<kind>`. */
+function tokenClass(t) {
+  let color = t.cls || '';
+  if (!color && t.color) {
+    for (const [re, cls] of COLOR_CLASS) if (re.test(t.color)) { color = cls; break; }
+    if (!color && /const/i.test(t.color)) {
+      color = t.text.startsWith('"') ? 'tok-str' : t.text.startsWith("'") ? 'tok-chr' : 'tok-num';
+    }
+  }
+  if (!color && t.kind === 'type') color = 'tok-type';
+  if (!color && t.kind === 'funcname') color = 'tok-fn';
+  if (!color && t.kind === 'comment') color = 'tok-com';
+  return ['t', `tk-${t.kind || 'syntax'}`, color].filter(Boolean).join(' ');
+}
+
+const attr = (name, value) => (value == null || value === '' ? '' : ` ${name}="${escapeHtml(String(value))}"`);
+
+function tokenHtml(t, ctx) {
+  const hex = addrHex(t.address_hex ?? t.address);
+  let callee = addrHex(t.callee_hex ?? t.callee);
+  if (!callee && t.kind === 'funcname') callee = ctx.fnByName?.get(t.text)?.address_hex || null;
+  let gaddr = null;
+  if (t.kind === 'variable' && !Number.isInteger(t.var) && !t.decl) {
+    gaddr = addrHex(t.global_hex ?? t.global) || ctx.globalsByName?.get(t.text) || null;
+    if (!gaddr) {
+      const m = /^dat_([0-9a-f]+)$/i.exec(t.text);
+      if (m) gaddr = addrHex('0x' + m[1]);
+    }
+  }
+  const sym = t.kind === 'variable' ? t.text : null;
+  const typeText = t.type ?? (t.kind === 'type' ? t.text : null);
+  return `<span class="${tokenClass(t)}"${attr('data-kind', t.kind)}${attr('data-sym', sym)}` +
+    `${attr('data-addr', hex)}${attr('data-callee', callee)}${attr('data-gaddr', gaddr)}` +
+    `${attr('data-type', typeText)}${attr('data-decl', t.decl)}${attr('data-var', Number.isInteger(t.var) ? t.var : null)}` +
+    `${t.fallback ? ' data-fb="1"' : ''}>${escapeHtml(t.text)}</span>`;
+}
+
+const plainHtml = (s, text) => (s.cls ? `<span class="${s.cls}">${escapeHtml(text)}</span>` : escapeHtml(text));
+
+/**
+ * One line's segments as HTML. With a `plan` (wrap-c.js `wrapPlan` of the
+ * line's text) each row is a `.wl` block carrying its indent as `--i`, so a
+ * row that is still wider than the pane soft-wraps under a hanging indent;
+ * the plan's breaks start rows, its drops leave brackets out. A break that
+ * would fall inside a token is left out.
+ */
+export function lineHtml(line, ctx = {}, plan = null) {
+  if (!plan) return line.map((s) => (s.tok ? tokenHtml(s.tok, ctx) : plainHtml(s, s.text))).join('');
+  const { breaks = [], drops = new Set() } = plan;
+  const rows = [];
+  let row = { indent: 0, html: '' };
+  let lead = true;
+  let off = 0;
+  let b = 0;
+  let eat = 0;
+  const newRow = (k) => {
+    rows.push(row);
+    row = { indent: k.indent, html: '' };
+    eat = k.eat;
+  };
+  for (const s of line) {
+    const start = off;
+    off += s.text.length;
+    while (b < breaks.length && breaks[b].at < start) b++;
+    if (s.tok) {
+      if (b < breaks.length && breaks[b].at === start) newRow(breaks[b++]);
+      let text = '';
+      for (let i = 0; i < s.text.length; i++) {
+        if (eat) { eat--; continue; }
+        if (!drops.has(start + i)) text += s.text[i];
+      }
+      lead = false;
+      if (text) row.html += tokenHtml(text === s.tok.text ? s.tok : { ...s.tok, text }, ctx);
+      continue;
+    }
+    let piece = '';
+    for (let i = 0; i < s.text.length; i++) {
+      if (b < breaks.length && breaks[b].at === start + i) {
+        if (piece) row.html += plainHtml(s, piece);
+        piece = '';
+        newRow(breaks[b++]);
+      }
+      if (eat) { eat--; continue; }
+      if (lead && s.text[i] === ' ') { row.indent++; continue; }
+      lead = false;
+      if (!drops.has(start + i)) piece += s.text[i];
+    }
+    if (piece) row.html += plainHtml(s, piece);
+  }
+  rows.push(row);
+  return rows.map((r) => `<span class="wl" style="--i:${r.indent}">${r.html}</span>`).join('');
+}
+
+/**
+ * The C pane's HTML: one `.d2-cl#c-L<n>` row per line with a line-number and
+ * address gutter, tokens as `.t` spans carrying their kind, symbol, address,
+ * callee, global address and type. The preamble's rows are `.d2-ty`, under a
+ * heading that folds them (folded unless `typesOpen`). `ctx`: `{index, segs, preamble,
+ * typesOpen, fnByName, globalsByName, planOf}` (`planOf(i)`: how line i wraps, or null).
+ */
+export function renderC(fnData, ctx = {}) {
+  const segs = ctx.segs || lineSegments(fnData).segs;
+  const index = ctx.index || buildIndex(fnData, segs);
+  const preamble = ctx.preamble ?? preambleLength(fnData);
+  if (!fnData.code && fnData.error) {
+    return `<div class="d2-cl d2-err"><span class="ct">${escapeHtml(`/* ${fnData.name} — decompile error:\n   ${fnData.error} */`)}</span></div>`;
+  }
+  let out = '<div class="d2-chunk">';
+  if (preamble) {
+    const n = fnData.types.length;
+    out += '<div class="d2-tyhead" role="presentation"><span class="ln"></span><span class="la"></span><span class="ct">' +
+      `<button class="d2-tytoggle" data-act="types-toggle" aria-expanded="${ctx.typesOpen ? 'true' : 'false'}">Types this function uses</button> <span class="d2-tyn">${n} type${n === 1 ? '' : 's'}</span></span></div>`;
+  }
+  segs.forEach((line, i) => {
+    if (i && i % CHUNK === 0) out += '</div><div class="d2-chunk">';
+    const n = i + 1;
+    const addrs = index.lineToInsns.get(n) || [];
+    const band = addrs.length ? bandOf(n) : null;
+    out += `<div class="d2-cl${i < preamble ? ' d2-ty' : ''}" id="c-L${n}" role="option" data-line="${n}"` +
+      `${attr('data-addrs', addrs.join(' '))}${attr('data-band', band)}>` +
+      `<span class="ln">${n}</span><span class="la">${escapeHtml(bare(addrs[0]))}</span><span class="ct">` +
+      `${lineHtml(line, ctx, i < preamble ? null : ctx.planOf?.(i) || null)}</span></div>`;
+  });
+  return out + '</div>';
+}
+
+/**
+ * How `newCode` differs from `oldCode` by line, from a longest common
+ * subsequence: `changed`, the 1-based lines of `newCode` outside it (what an
+ * edit changed), and `lineOf(n)`, the line old line n is now (a changed line
+ * moves with the nearest kept line above it, or below it at the top). Large
+ * bodies skip the quadratic table and report nothing (`lineOf` null) rather
+ * than stall the page.
+ */
+export function diffLines(oldCode, newCode) {
+  const a = (oldCode || '').split('\n');
+  const b = (newCode || '').split('\n');
+  const changed = new Set();
+  if (!oldCode) return { changed, lineOf: null };
+  if (a.length * b.length > 4e6) return { changed, lineOf: null };
+  if (oldCode === newCode) return { changed, lineOf: (n) => n };
+  const w = b.length + 1;
+  const dp = new Uint32Array((a.length + 1) * w);
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      dp[i * w + j] = a[i] === b[j] ? dp[(i + 1) * w + j + 1] + 1 : Math.max(dp[(i + 1) * w + j], dp[i * w + j + 1]);
+    }
+  }
+  const delta = new Int32Array(a.length);
+  let i = 0, j = 0, last = null;
+  while (j < b.length) {
+    if (i < a.length && a[i] === b[j]) {
+      if (last === null) delta.fill(j - i, 0, i);
+      last = j - i;
+      delta[i++] = last;
+      j++;
+    } else if (i < a.length && dp[(i + 1) * w + j] >= dp[i * w + j + 1]) delta[i++] = last ?? 0;
+    else { changed.add(j + 1); j++; }
+  }
+  while (i < a.length) delta[i++] = last ?? 0;
+  let next = b.length;
+  for (let k = a.length - 1; k >= 0; k--) {
+    next = Math.min(next, Math.max(1, k + 1 + delta[k]));
+    delta[k] = next;
+  }
+  return { changed, lineOf: (n) => (n >= 1 && n <= a.length ? delta[n - 1] : n) };
+}
+
+/** The 1-based lines of `newCode` an edit changed (`diffLines`). */
+export function changedLines(oldCode, newCode) {
+  return diffLines(oldCode, newCode).changed;
+}
